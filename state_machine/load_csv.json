@@ -1,0 +1,207 @@
+{
+  "Comment": "Load CSV state machine",
+  "StartAt": "Prepare table",
+  "States": {
+    "Prepare table": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "Payload.$": "$",
+        "FunctionName": "${PrepareTableFunction}"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "Map",
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Cleanup",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    "Cleanup": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "Payload.$": "$",
+        "FunctionName": "${CleanupOnErrorFunction}"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "ShouldRetry",
+      "ResultPath": "$.result",
+      "ResultSelector": {
+        "executionId.$": "$$.Execution.Id"
+      },
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Failed Notification"
+        }
+      ]
+    },
+    "ShouldRetry": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Not": {
+            "Variable": "$.retry",
+            "IsPresent": true
+          },
+          "Next": "BuildPayload"
+        }
+      ],
+      "Default": "Failed Notification"
+    },
+    "BuildPayload": {
+      "Type": "Pass",
+      "Next": "Prepare table",
+      "Parameters": {
+        "table.$": "$.table",
+        "retry": true
+      }
+    },
+    "Failed Notification": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "Message.$": "$",
+        "TopicArn": "${FailedNotificationTopic}"
+      },
+      "Next": "Fail"
+    },
+    "Fail": {
+      "Type": "Fail"
+    },
+    "Map": {
+      "Type": "Map",
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "DISTRIBUTED",
+          "ExecutionType": "EXPRESS"
+        },
+        "StartAt": "Process CSV",
+        "States": {
+          "Process CSV": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+              "Payload.$": "$",
+              "FunctionName": "${LoadCSVFunction}"
+            },
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 1,
+                "BackoffRate": 2
+              }
+            ],
+            "End": true
+          }
+        }
+      },
+      "Label": "Map",
+      "MaxConcurrency": 25,
+      "ItemReader": {
+        "Resource": "arn:aws:states:::s3:listObjectsV2",
+        "Parameters": {
+          "Bucket": "${SourceS3Bucket}",
+          "Prefix.$": "$.table"
+        }
+      },
+      "ResultWriter": {
+        "Resource": "arn:aws:states:::s3:putObject",
+        "Parameters": {
+          "Bucket": "${LogsBucketName}",
+          "Prefix": "logs"
+        }
+      },
+      "Next": "Rename table",
+      "ItemBatcher": {
+        "MaxItemsPerBatch": 25,
+        "BatchInput": {
+          "table.$": "$.table"
+        }
+      },
+      "ResultPath": "$.loadResult",
+      "InputPath": "$",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Cleanup",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ToleratedFailurePercentage": 1
+    },
+    "Rename table": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "OutputPath": "$.Payload",
+      "Parameters": {
+        "Payload.$": "$",
+        "FunctionName": "${RenameTableFunction}"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "End": true,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Cleanup",
+          "ResultPath": "$.error"
+        }
+      ]
+    }
+  }
+}

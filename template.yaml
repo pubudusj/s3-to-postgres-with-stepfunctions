@@ -1,0 +1,187 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  s3-to-postgres-data-load
+
+  SAM Template for s3-to-postgres-data-load
+
+Parameters:
+  DbConnectionStringSSMPath:
+    Type: String
+    Default: dataLoad/dbConnectionString
+  RDSDatabaseArn:
+    Type: String
+
+Globals:
+  Function:
+    Timeout: 60
+    MemorySize: 128
+    Architectures:
+      - x86_64
+
+Resources:
+  SourceS3Bucket:
+    Type: AWS::S3::Bucket
+
+  ProcessedLogsS3Bucket:
+    Type: AWS::S3::Bucket
+
+  DataLoadSharedResourcesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      ContentUri: src/shared_resources/
+      CompatibleRuntimes:
+        - python3.9
+      RetentionPolicy: Delete
+    Metadata:
+      BuildMethod: python3.9
+
+  PrepareTableFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/prepare_table/
+      Handler: app.lambda_handler
+      Runtime: python3.9
+      Timeout: 300
+      Environment:
+        Variables:
+          DB_CONNECTION_STRING: !Ref DbConnectionStringSSMPath
+      Layers:
+        - !Ref DataLoadSharedResourcesLayer
+      Policies:
+        - SSMParameterReadPolicy:
+            ParameterName: !Ref DbConnectionStringSSMPath
+
+  CleanupOnErrorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/cleanup/
+      Handler: app.lambda_handler
+      Runtime: python3.9
+      Timeout: 120
+      Environment:
+        Variables:
+          DB_CONNECTION_STRING: !Ref DbConnectionStringSSMPath
+      Layers:
+        - !Ref DataLoadSharedResourcesLayer
+      Policies:
+        - SSMParameterReadPolicy:
+            ParameterName: !Ref DbConnectionStringSSMPath
+
+  LoadCSVFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/load_csv/
+      Handler: app.lambda_handler
+      Runtime: python3.9
+      Timeout: 300
+      Layers:
+        - !Ref DataLoadSharedResourcesLayer
+      Policies:
+        - SSMParameterReadPolicy:
+            ParameterName: !Ref DbConnectionStringSSMPath
+      Environment:
+        Variables:
+          SOURCE_S3_BUCKET: !Ref SourceS3Bucket
+          BUCKET_REGION: !Sub ${AWS::Region}
+          DB_CONNECTION_STRING: !Ref DbConnectionStringSSMPath
+
+  RenameTableFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/rename_table/
+      Handler: app.lambda_handler
+      Runtime: python3.9
+      Timeout: 540
+      Environment:
+        Variables:
+          DB_CONNECTION_STRING: !Ref DbConnectionStringSSMPath
+      Layers:
+        - !Ref DataLoadSharedResourcesLayer
+      Policies:
+        - SSMParameterReadPolicy:
+            ParameterName: !Ref DbConnectionStringSSMPath
+
+  FailedNotificationTopic:
+    Type: AWS::SNS::Topic
+
+  CsvLoaderStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: 'PostgresDataLoaderStateMachineTemp'
+      DefinitionUri: state_machine/load_csv.json
+      DefinitionSubstitutions:
+        PrepareTableFunction: !GetAtt PrepareTableFunction.Arn
+        LoadCSVFunction: !GetAtt LoadCSVFunction.Arn
+        RenameTableFunction: !GetAtt RenameTableFunction.Arn
+        CleanupOnErrorFunction: !GetAtt CleanupOnErrorFunction.Arn
+        SourceS3Bucket: !Ref SourceS3Bucket
+        FailedNotificationTopic: !Ref FailedNotificationTopic
+        LogsBucketName: !Ref ProcessedLogsS3Bucket
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref PrepareTableFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref LoadCSVFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref RenameTableFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref CleanupOnErrorFunction
+        - S3WritePolicy:
+            BucketName: !Ref ProcessedLogsS3Bucket
+        - S3ReadPolicy:
+            BucketName: !Ref SourceS3Bucket
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt FailedNotificationTopic.TopicName
+        - StepFunctionsExecutionPolicy:
+            StateMachineName: 'PostgresDataLoaderStateMachineTemp'
+
+  RDSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - rds.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Sub ${AWS::AccountId}
+                'aws:SourceArn': !Ref RDSDatabaseArn
+      Path: /
+
+
+  RDSRolePolicies:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: "PostgresRolePolicy"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !GetAtt SourceS3Bucket.Arn
+              - !Join
+                - ''
+                - - !GetAtt SourceS3Bucket.Arn
+                  - '/*'
+      Roles:
+        - !Ref RDSRole
+
+Outputs:
+  S3SourceBucket:
+    Description: S3 Source Bucket.
+    Value: !Ref SourceS3Bucket
+  RDSRole:
+    Description: IAM Role for RDS
+    Value: !Ref RDSRole
+  SNSTopic:
+    Description: Failure Notification SNS Topic
+    Value: !Ref FailedNotificationTopic
